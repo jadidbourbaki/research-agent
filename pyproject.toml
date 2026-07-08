@@ -1,0 +1,30 @@
+[project]
+name = "zaki-agent"
+version = "0.1.0"
+description = "Compare skill vs subagent agent designs on the same problem"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic==0.116.0",
+]
+
+[project.scripts]
+zaki-agent = "zaki_agent.__main__:main"
+
+[dependency-groups]
+dev = [
+    "ruff==0.15.20",
+    "ty==0.0.57",
+    "pytest==9.1.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zaki_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
