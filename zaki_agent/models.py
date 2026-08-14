@@ -48,8 +48,11 @@ class Usage:
 @dataclass
 class RunResult:
     question_id: str
+    capability: str
+    coupling: str
     hops: int
     mode: str
+    seed: int
     answer: str
     correct: bool
     latency_s: float

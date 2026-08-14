@@ -1,19 +1,20 @@
-"""The two designs under study.
+"""The two designs under study, parametrized over capabilities.
 
 Both modes run the SDK's tool runner, which drives the tool-use loop for us.
-They differ only in the tool the main agent is given and where the lookup work
-runs:
+For a given question's capability (see CAPABILITIES), they differ only in
+where that capability's tool runs:
 
-- skill mode gives the main agent the search_documents tool and the lookup
-  instructions inline, so it reads documents in its own context.
+- skill mode gives the main agent the capability's tool and skill prompt
+  inline, so it reads the underlying data in its own context.
 - subagent mode gives the main agent a lookup tool that spawns a subagent with
-  a fresh context. The subagent reads documents and returns a short answer, so
-  the document text never enters the main context.
+  a fresh context, running the same capability. The subagent reads the data
+  and returns a short answer, so the raw data never enters the main context.
 """
 
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 
 import anthropic
 from anthropic import beta_tool
@@ -32,15 +33,70 @@ LOOKUP_SKILL = (
     "When you have the answer, reply with the answer alone and nothing else."
 )
 
-# Subagent mode: the coordinator has no document access of its own.
+METRICS_SKILL = (
+    "You answer questions about company revenue using the query_revenue tool. "
+    "Call it with a company name for that company's figures, or with an empty "
+    "string to get every company's figures when a question requires comparing "
+    "across companies. Do not rely on prior knowledge, these figures exist "
+    "only in this tool's data. When you have the answer, reply with the answer "
+    "alone and nothing else."
+)
+
+# Subagent mode: the coordinator has no data access of its own, whatever the
+# question's capability. It must delegate everything through the lookup tool.
 COORDINATOR_SYSTEM = (
     "You are a research coordinator answering a question that requires one or "
-    "more factual lookups. You do not have direct access to any documents. Use "
-    "the lookup tool for each single, self-contained factual question, then "
-    "combine the results. When a question is multi-hop, look up one fact, then "
-    "use it to phrase the next lookup. When you have the answer, reply with the "
-    "answer alone and nothing else."
+    "more factual lookups. You have no knowledge of your own about the entities "
+    "in the question, and no data access other than the lookup tool. Never "
+    "answer from a guess: use the lookup tool for each self-contained factual "
+    "question, then combine the results. When a question is multi-hop, look up "
+    "one fact, then use it to phrase the next lookup. When a question requires "
+    "comparing several entities, delegate a question that covers all of them, "
+    "or delegate each one separately, whichever is more natural. When you have "
+    "the answer, reply with the answer alone and nothing else."
 )
+
+# For the Stage A no-tools baseline filter (see validate_tasks.py): if this
+# gets a synthetic-world question right, the task is answerable by guessing
+# or memorization, not by the retrieval it's meant to require.
+BASELINE_SYSTEM = (
+    "Answer the question if you know it. If you do not know the answer, say "
+    '"I don\'t know" and nothing else. Never guess.'
+)
+
+
+@beta_tool
+def search_documents(query: str) -> str:
+    """Search the documents and return the most relevant ones in full.
+
+    Args:
+        query: Keywords describing the fact you are looking for.
+    """
+    return knowledge.search_documents(query)
+
+
+@beta_tool
+def query_revenue(company: str) -> str:
+    """Look up a company's annual revenue figures.
+
+    Args:
+        company: Company name to look up, or an empty string to get every
+            company's figures for comparison.
+    """
+    return knowledge.query_revenue(company)
+
+
+@dataclass(frozen=True)
+class Capability:
+    name: str
+    skill_prompt: str
+    tool: object
+
+
+CAPABILITIES = {
+    "lookup": Capability("lookup", LOOKUP_SKILL, search_documents),
+    "metrics": Capability("metrics", METRICS_SKILL, query_revenue),
+}
 
 
 def _text_of(message: BetaMessage | None) -> str:
@@ -78,52 +134,42 @@ class ResearchAgent:
             final = message
         return _text_of(final)
 
-    def _run_subagent(self, sub_question: str, sub_usage: Usage) -> str:
-        @beta_tool
-        def search_documents(query: str) -> str:
-            """Search the documents and return the most relevant ones in full.
+    def _run_subagent(
+        self, capability: Capability, sub_question: str, sub_usage: Usage
+    ) -> str:
+        return self._drive(
+            capability.skill_prompt, sub_question, [capability.tool], sub_usage
+        )
 
-            Args:
-                query: Keywords describing the fact you are looking for.
-            """
-            return knowledge.search_documents(query)
+    def run_baseline(self, prompt: str) -> str:
+        """Answer with no tools at all, for the Stage A no-tools pre-filter."""
+        return self._drive(BASELINE_SYSTEM, prompt, [], Usage())
 
-        return self._drive(LOOKUP_SKILL, sub_question, [search_documents], sub_usage)
-
-    def run(self, question: knowledge.Question, mode: str) -> RunResult:
+    def run(self, question: knowledge.Question, mode: str, seed: int = 0) -> RunResult:
         main_usage = Usage()
         sub_usage = Usage()
         sub_calls = 0
         start = time.monotonic()
+        capability = CAPABILITIES[question.capability]
 
         if mode == "skill":
-
-            @beta_tool
-            def search_documents(query: str) -> str:
-                """Search the documents and return the most relevant ones in full.
-
-                Args:
-                    query: Keywords describing the fact you are looking for.
-                """
-                return knowledge.search_documents(query)
-
-            system = f"{LOOKUP_SKILL}\n\nThe question may require several steps."
-            answer = self._drive(
-                system, question.prompt, [search_documents], main_usage
+            system = (
+                f"{capability.skill_prompt}\n\nThe question may require several steps."
             )
+            answer = self._drive(system, question.prompt, [capability.tool], main_usage)
         elif mode == "subagent":
 
             @beta_tool
             def lookup(sub_question: str) -> str:
-                """Delegate one self-contained factual lookup to a research
-                assistant that has access to the documents.
+                """Delegate one self-contained factual question to a research
+                assistant that has access to the data needed to answer it.
 
                 Args:
                     sub_question: One self-contained factual question.
                 """
                 nonlocal sub_calls
                 sub_calls += 1
-                return self._run_subagent(sub_question, sub_usage)
+                return self._run_subagent(capability, sub_question, sub_usage)
 
             answer = self._drive(
                 COORDINATOR_SYSTEM, question.prompt, [lookup], main_usage
@@ -134,8 +180,11 @@ class ResearchAgent:
         latency = time.monotonic() - start
         return RunResult(
             question_id=question.id,
+            capability=question.capability,
+            coupling=question.coupling,
             hops=question.hops,
             mode=mode,
+            seed=seed,
             answer=answer,
             correct=knowledge.is_correct(answer, question.answer),
             latency_s=latency,
